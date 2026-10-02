@@ -1,0 +1,135 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS source
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends gpgv \
+ && rm -rf /var/lib/apt/lists/*
+ARG VERSION
+ARG SOURCE_SHA256
+ADD --checksum=sha256:${SOURCE_SHA256} https://github.com/openssl/openssl/releases/download/openssl-${VERSION}/openssl-${VERSION}.tar.gz /src/
+ADD https://github.com/openssl/openssl/releases/download/openssl-${VERSION}/openssl-${VERSION}.tar.gz.asc /src/
+# OpenSSL release signing key, fingerprint B146 647E 45A7 B339 47AB 226B 2A2C 87D1 6169 2D40.
+# Releases are signed with its subkey C46E D3F2 CBEF DA1F DAAD A442 64ED 7B1D CCE7 1CB2,
+# which expires on 2027-05-26. A release signed with any other key fails here
+# until that key is added to keys/openssl-release.gpg.
+COPY keys/openssl-release.gpg /tmp/openssl-release.gpg
+WORKDIR /src
+RUN set -eu; \
+    gpgv --keyring /tmp/openssl-release.gpg "openssl-${VERSION}.tar.gz.asc" "openssl-${VERSION}.tar.gz"; \
+    mkdir openssl; \
+    tar -xzf "openssl-${VERSION}.tar.gz" -C openssl --strip-components=1
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# The base image's packages are recorded before anything is installed, so that
+# runtime-deps can leave them out. Every image that installs runtime-deps is
+# built on the same base.
+RUN dpkg-query -W -f '${Package}\n' | LC_ALL=C sort -u > /tmp/base-packages; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      perl; \
+    rm -rf /var/lib/apt/lists/*
+COPY --link --from=source /src/openssl /src/openssl
+WORKDIR /src/openssl
+ARG JOBS
+# --libdir=lib keeps the libraries in /usr/local/lib on amd64 as well, where
+# the linux-x86_64 target defaults to lib64. The rpath lets the openssl binary
+# and the legacy provider load this build's libssl and libcrypto from there
+# without ldconfig; the distro's OpenSSL 3 libraries have other sonames.
+RUN ./Configure \
+      --prefix=/usr/local \
+      --openssldir=/usr/local/ssl \
+      --libdir=lib \
+      shared \
+      no-docs \
+      no-tests \
+      -Wl,-rpath,/usr/local/lib; \
+    make -j"${JOBS:-$(nproc)}"; \
+    make DESTDIR=/out install_sw install_ssldirs
+
+ARG BASE_IMAGE
+ARG VERSION
+# Headers, static libraries, pkg-config and CMake files only serve programs
+# built against this OpenSSL, and ssl/misc holds CA.pl and tsget, which need
+# Perl. The soname version of libssl and libcrypto is SHLIB_VERSION in
+# VERSION.dat. certs and cert.pem in the OpenSSL directory point to the
+# distro's CA certificates; the links resolve in the image, where
+# ca-certificates is installed. runtime-deps lists the packages that own the
+# libraries the binaries load, minus the base image's packages, plus the
+# packages in runtime-deps.ubuntu.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    rm -rf \
+      /out/usr/local/include \
+      /out/usr/local/lib/cmake \
+      /out/usr/local/lib/pkgconfig \
+      /out/usr/local/ssl/misc; \
+    rm -f \
+      /out/usr/local/lib/*.a \
+      /out/usr/local/lib/libcrypto.so \
+      /out/usr/local/lib/libssl.so \
+      /out/usr/local/ssl/*.dist; \
+    shlib="$(sed -n 's/^SHLIB_VERSION=//p' VERSION.dat)"; \
+    case "${shlib}" in '' | *[!0-9]*) echo "unexpected SHLIB_VERSION: ${shlib}" >&2; exit 1 ;; esac; \
+    for f in bin/openssl "lib/libssl.so.${shlib}" "lib/libcrypto.so.${shlib}" lib/ossl-modules/legacy.so; do \
+      strip --strip-unneeded "/out/usr/local/$f"; \
+      readelf -d "/out/usr/local/$f" > /tmp/dynamic; \
+      grep -Eq 'Library (rpath|runpath): \[/usr/local/lib\]' /tmp/dynamic \
+        || { echo "$f has no rpath /usr/local/lib" >&2; exit 1; }; \
+    done; \
+    rmdir /out/usr/local/ssl/certs; \
+    ln -s /etc/ssl/certs /out/usr/local/ssl/certs; \
+    ln -s /etc/ssl/certs/ca-certificates.crt /out/usr/local/ssl/cert.pem; \
+    LD_LIBRARY_PATH=/out/usr/local/lib /out/usr/local/bin/openssl version > /tmp/openssl-version; \
+    if [ "$(cut -d' ' -f2 /tmp/openssl-version)" != "${VERSION}" ] \
+      || ! grep -Fq "(Library: OpenSSL ${VERSION} " /tmp/openssl-version; then \
+      cat /tmp/openssl-version >&2; exit 1; \
+    fi; \
+    meta=/out/usr/local/share/randomcontainers/openssl; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE.txt "$meta/licenses/"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/openssl/openssl/releases/download/openssl-${VERSION}/openssl-${VERSION}.tar.gz" \
+      "https://github.com/openssl/openssl/releases/download/openssl-${VERSION}/openssl-${VERSION}.tar.gz.asc" \
+      "https://github.com/randomcontainers/openssl/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      echo "configure: $(sed -n 's/^CONFIGURE_ARGS=//p' Makefile)"; \
+      LD_LIBRARY_PATH=/out/usr/local/lib /out/usr/local/bin/openssl version -v -p -f -d -m; \
+    } > "$meta/buildinfo"; \
+    find /out/usr/local -type f \( -perm -u+x -o -name '*.so*' \) -print0 \
+      | xargs -0 env LD_LIBRARY_PATH=/out/usr/local/lib ldd > /tmp/ldd 2>&1 || true; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// && $3 !~ /^\/out\// { print $3 }' /tmp/ldd | LC_ALL=C sort -u > /tmp/libs; \
+    test -s /tmp/libs; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | LC_ALL=C sort -u | LC_ALL=C comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+# ca-certificates depends on Ubuntu's openssl package, so /usr/bin/openssl
+# (OpenSSL 3) is in the image too. Installing it before /usr/local is copied
+# in means its scripts run with that openssl, not with this build.
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/openssl/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /tmp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "openssl"]
+CMD ["help"]
