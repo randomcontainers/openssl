@@ -1,0 +1,123 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS source
+# The release tarball is made by git archive and carries pax headers; GNU tar
+# handles them fully.
+RUN apk add --no-cache gpgv tar
+ARG VERSION
+ARG SOURCE_SHA256
+ADD --checksum=sha256:${SOURCE_SHA256} https://github.com/openssl/openssl/releases/download/openssl-${VERSION}/openssl-${VERSION}.tar.gz /src/
+ADD https://github.com/openssl/openssl/releases/download/openssl-${VERSION}/openssl-${VERSION}.tar.gz.asc /src/
+# OpenSSL release signing key, fingerprint B146 647E 45A7 B339 47AB 226B 2A2C 87D1 6169 2D40.
+# Releases are signed with its subkey C46E D3F2 CBEF DA1F DAAD A442 64ED 7B1D CCE7 1CB2,
+# which expires on 2027-05-26. A release signed with any other key fails here
+# until that key is added to keys/openssl-release.gpg.
+COPY keys/openssl-release.gpg /tmp/openssl-release.gpg
+WORKDIR /src
+RUN set -eu; \
+    gpgv --keyring /tmp/openssl-release.gpg "openssl-${VERSION}.tar.gz.asc" "openssl-${VERSION}.tar.gz"; \
+    mkdir openssl; \
+    tar -xzf "openssl-${VERSION}.tar.gz" -C openssl --strip-components=1
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+# linux-headers provides linux/mman.h, which crypto/mem_sec.c includes on musl.
+RUN apk add --no-cache \
+      build-base \
+      linux-headers \
+      perl \
+      scanelf
+COPY --link --from=source /src/openssl /src/openssl
+WORKDIR /src/openssl
+ARG JOBS
+# --libdir=lib keeps the libraries in /usr/local/lib on x86_64 as well, where
+# the linux-x86_64 target defaults to lib64. The rpath lets the openssl binary
+# and the legacy provider load this build's libssl and libcrypto from there;
+# the distro's OpenSSL 3 libraries have other sonames.
+RUN ./Configure \
+      --prefix=/usr/local \
+      --openssldir=/usr/local/ssl \
+      --libdir=lib \
+      shared \
+      no-docs \
+      no-tests \
+      -Wl,-rpath,/usr/local/lib; \
+    make -j"${JOBS:-$(nproc)}"; \
+    make DESTDIR=/out install_sw install_ssldirs
+
+ARG BASE_IMAGE
+ARG VERSION
+# Headers, static libraries, pkg-config and CMake files only serve programs
+# built against this OpenSSL, and ssl/misc holds CA.pl and tsget, which need
+# Perl. The soname version of libssl and libcrypto is SHLIB_VERSION in
+# VERSION.dat. certs and cert.pem in the OpenSSL directory point to the
+# distro's CA certificates; the links resolve in the image, where
+# ca-certificates is installed. runtime-deps lists the so: names the binaries
+# need, minus the libraries built here, plus the packages in
+# runtime-deps.alpine.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    rm -rf \
+      /out/usr/local/include \
+      /out/usr/local/lib/cmake \
+      /out/usr/local/lib/pkgconfig \
+      /out/usr/local/ssl/misc; \
+    rm -f \
+      /out/usr/local/lib/*.a \
+      /out/usr/local/lib/libcrypto.so \
+      /out/usr/local/lib/libssl.so \
+      /out/usr/local/ssl/*.dist; \
+    shlib="$(sed -n 's/^SHLIB_VERSION=//p' VERSION.dat)"; \
+    case "${shlib}" in '' | *[!0-9]*) echo "unexpected SHLIB_VERSION: ${shlib}" >&2; exit 1 ;; esac; \
+    for f in bin/openssl "lib/libssl.so.${shlib}" "lib/libcrypto.so.${shlib}" lib/ossl-modules/legacy.so; do \
+      strip --strip-unneeded "/out/usr/local/$f"; \
+      readelf -d "/out/usr/local/$f" > /tmp/dynamic; \
+      grep -Eq 'Library (rpath|runpath): \[/usr/local/lib\]' /tmp/dynamic \
+        || { echo "$f has no rpath /usr/local/lib" >&2; exit 1; }; \
+    done; \
+    rmdir /out/usr/local/ssl/certs; \
+    ln -s /etc/ssl/certs /out/usr/local/ssl/certs; \
+    ln -s /etc/ssl/certs/ca-certificates.crt /out/usr/local/ssl/cert.pem; \
+    LD_LIBRARY_PATH=/out/usr/local/lib /out/usr/local/bin/openssl version > /tmp/openssl-version; \
+    if [ "$(cut -d' ' -f2 /tmp/openssl-version)" != "${VERSION}" ] \
+      || ! grep -Fq "(Library: OpenSSL ${VERSION} " /tmp/openssl-version; then \
+      cat /tmp/openssl-version >&2; exit 1; \
+    fi; \
+    meta=/out/usr/local/share/randomcontainers/openssl; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE.txt "$meta/licenses/"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/openssl/openssl/releases/download/openssl-${VERSION}/openssl-${VERSION}.tar.gz" \
+      "https://github.com/openssl/openssl/releases/download/openssl-${VERSION}/openssl-${VERSION}.tar.gz.asc" \
+      "https://github.com/randomcontainers/openssl/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(cc --version | head -n 1)"; \
+      echo "configure: $(sed -n 's/^CONFIGURE_ARGS=//p' Makefile)"; \
+      LD_LIBRARY_PATH=/out/usr/local/lib /out/usr/local/bin/openssl version -v -p -f -d -m; \
+    } > "$meta/buildinfo"; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | LC_ALL=C sort -u > /tmp/needed; \
+    grep -qx "libcrypto\.so\.${shlib}" /tmp/needed; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    test -s /tmp/elf-deps; \
+    LC_ALL=C sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/openssl/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /tmp/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "openssl"]
+CMD ["help"]
